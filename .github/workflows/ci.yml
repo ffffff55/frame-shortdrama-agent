@@ -5,12 +5,16 @@ on:
     paths:
       - "packages/**"
       - "package*.json"
+      - "docs/**"
+      - "*.md"
       - ".github/workflows/ci.yml"
   push:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - "packages/**"
       - "package*.json"
+      - "docs/**"
+      - "*.md"
       - ".github/workflows/ci.yml"
 
 concurrency:
@@ -63,3 +67,71 @@ jobs:
         run: npm --prefix packages/web test
       - name: Build frontend
         run: npm --prefix packages/web run build
+
+  autopilot:
+    name: PR Autopilot
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false && github.event.pull_request.base.ref == 'dev'
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.19.0
+      - name: "Guard: conflicts, size, protected paths"
+        id: guard
+        run: |
+          set -euo pipefail
+          gh pr view "$PR_NUMBER" --json isDraft,mergeable,additions,deletions,files > /tmp/pr.json
+          python3 - <<'PY' > /tmp/guard.txt
+          import json
+
+          d = json.load(open('/tmp/pr.json'))
+          reasons = []
+
+          if d.get('mergeable') != 'MERGEABLE':
+              reasons.append('分支有冲突或合并状态未知：' + str(d.get('mergeable')))
+
+          print('OK' if not reasons else 'BLOCK: ' + '；'.join(sorted(set(reasons))[:6]))
+          PY
+          RESULT="$(cat /tmp/guard.txt)"
+          echo "reason=$RESULT" >> "$GITHUB_OUTPUT"
+          if [ "$RESULT" = "OK" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: AI review (optional)
+        id: review
+        if: steps.guard.outputs.ok == 'true'
+        continue-on-error: true
+        env:
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_DEFAULT_MODEL: ${{ secrets.LLM_DEFAULT_MODEL }}
+        run: python3 .github/scripts/pr_ai_review.py
+
+      - name: Merge when safe
+        if: steps.guard.outputs.ok == 'true' && steps.review.outputs.should_merge != 'false'
+        run: |
+          set -euo pipefail
+          if gh pr merge "$PR_NUMBER" --squash; then
+            gh pr comment "$PR_NUMBER" --body "PR Autopilot：测试通过、无冲突，已自动 squash 合并到 dev。"
+          else
+            gh pr comment "$PR_NUMBER" --body "PR Autopilot：条件满足，但合并被分支保护规则拦下。请人工处理。"
+            exit 1
+          fi
+
+      - name: Comment when blocked
+        if: steps.guard.outputs.ok != 'true'
+        run: |
+          gh pr comment "$PR_NUMBER" --body "PR Autopilot：未自动合并，原因：${{ steps.guard.outputs.reason }}。已留待人工处理。"

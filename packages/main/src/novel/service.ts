@@ -5,7 +5,8 @@ import { assertModelSelection, configForRole } from '../models/connections';
 import { ModelError } from '@lyra/shared';
 import {
   NovelError, buildNovelSource, getChapter, createReviewSeed, applyNovelCorrections,
-  validateNovelContent, type NovelRevision, type NovelContent,
+  validateNovelContent, novelChapterTooLong, novelCheckpointGate, novelResumeRefusal, countNovelParagraphs,
+  type NovelRevision, type NovelContent,
 } from '@lyra/shared';
 import { NovelExtractor } from './extractor';
 import type { NovelRepository } from './repository';
@@ -13,6 +14,8 @@ import type { AssetService } from '../assets/service';
 import { applyNovelAssetBindings } from './assets';
 import { NovelReviewWorkflow } from './workflow';
 import { buildEntityRegistry } from '@lyra/shared';
+import { buildNovelScreenplay } from '@lyra/agent';
+import type { BreakdownRepository } from '../breakdown/repository';
 
 export interface NovelAssetLinkAuthorization { candidateId: string }
 export interface NovelAssetLinkPolicy {
@@ -35,11 +38,11 @@ function expected(value: unknown): string | null {
 }
 const id = (prefix: string) => `${prefix}_${randomUUID().replaceAll('-', '')}`;
 
-/** Novel chapters never enter screenplay scenes or storyboard generation. */
 export class NovelService {
   constructor(private readonly repository: NovelRepository, private readonly config: AppConfig,
     private readonly transport: typeof fetch = fetch, private readonly assets?: AssetService,
-    private readonly assetLinkPolicy?: NovelAssetLinkPolicy) {}
+    private readonly assetLinkPolicy?: NovelAssetLinkPolicy,
+    private readonly adaptations?: Pick<BreakdownRepository, 'saveNovelAdaptation'>) {}
   list() { return this.repository.listSources(); }
   async create(value: unknown) {
     const input = request(value, ['title', 'rawText', 'sourceUrl']);
@@ -55,6 +58,43 @@ export class NovelService {
     const source = await this.repository.getSource(sourceId);
     if (!source) throw new NovelError(404, 'NOVEL_NOT_FOUND', '小说原文不存在。');
     return source;
+  }
+  private async screenplayDraft(sourceId: string, chapters: unknown) {
+    if (!Array.isArray(chapters) || !chapters.length || chapters.length > 2000) {
+      throw new NovelError(400, 'NOVEL_ADAPTATION_SELECTION_INVALID', '请选择已拆解的连续章节。');
+    }
+    const source = await this.get(sourceId);
+    const selectedChapters = [];
+    let previousOrder = 0;
+    for (const raw of chapters) {
+      const ref = request(raw, ['chapterId', 'revisionId']);
+      const chapterId = expected(ref.chapterId);
+      const revisionId = expected(ref.revisionId);
+      if (!chapterId || !revisionId) throw new NovelError(400, 'NOVEL_ADAPTATION_REVISION_REQUIRED', '每章都需要一个已保存的拆解版本。');
+      const chapter = getChapter(source, chapterId);
+      if (previousOrder && chapter.order !== previousOrder + 1) {
+        throw new NovelError(400, 'NOVEL_ADAPTATION_SELECTION_INVALID', '章节须按原书顺序连续且不重复。');
+      }
+      if (revisionId !== chapter.latestRevisionId) throw new NovelError(409, 'NOVEL_REVISION_CONFLICT', '章节版本有更新，请刷新后重新预览。');
+      selectedChapters.push({ chapter, revisionId });
+      previousOrder = chapter.order;
+    }
+    const revisions = await this.repository.getSourceRevisions(source, selectedChapters.map(item => item.revisionId));
+    return buildNovelScreenplay(source, selectedChapters.map(({ chapter, revisionId }) => {
+      const revision = revisions.get(revisionId);
+      if (revision?.chapterId !== chapter.id) throw new NovelError(409, 'NOVEL_REVISION_CONFLICT', '缺少本章对应的拆解版本。');
+      return { chapter, revision };
+    }));
+  }
+  previewAdaptation(sourceId: string, value: unknown) {
+    return this.screenplayDraft(sourceId, request(value, ['chapters']).chapters);
+  }
+  async adoptAdaptation(sourceId: string, value: unknown) {
+    if (!this.adaptations) throw new NovelError(503, 'ADAPTATION_STORAGE_UNAVAILABLE', '剧本项目存储尚未就绪。');
+    const input = request(value, ['chapters', 'digest']);
+    const draft = await this.screenplayDraft(sourceId, input.chapters);
+    if (input.digest !== draft.digest) throw new NovelError(409, 'NOVEL_ADAPTATION_PREVIEW_CHANGED', '草稿已变化，请重新预览后采用。');
+    return this.adaptations.saveNovelAdaptation(draft);
   }
   private async chapter(chapterId: string) {
     const source = await this.repository.getChapterSource(chapterId);
@@ -130,9 +170,15 @@ export class NovelService {
     return this.save(chapter.id, revisionId, 'user', content);
   }
   async extract(chapterId: string, value: unknown) {
-    const input = request(value, ['expectedRevisionId', 'allowPaid', 'mode', 'resumeRevisionId', 'expectedModelConnectionRevision']);
+    const input = request(value, ['expectedRevisionId', 'allowPaid', 'mode', 'resumeRevisionId', 'confirmRestart', 'expectedModelConnectionRevision']);
     if (input.mode !== undefined && !['single', 'reviewed'].includes(input.mode as string)) {
       throw new NovelError(400, 'NOVEL_REQUEST_INVALID', '未知拆解模式。');
+    }
+    if (input.confirmRestart !== undefined && input.confirmRestart !== true) {
+      throw new NovelError(400, 'NOVEL_REQUEST_INVALID', '重新提取需要明确确认。');
+    }
+    if (input.confirmRestart === true && input.resumeRevisionId !== undefined) {
+      throw new NovelError(400, 'NOVEL_REQUEST_INVALID', '不能同时继续检查点并重新提取。');
     }
     const base = expected(input.expectedRevisionId);
     if (input.allowPaid !== true) throw new NovelError(400, 'PAID_CONFIRMATION_REQUIRED', '请明确确认本章所选拆解模式可能消耗模型额度。');
@@ -140,13 +186,31 @@ export class NovelService {
     assertModelSelection(config, input.expectedModelConnectionRevision);
     new ModelClient(config, this.transport).assertConfigured();
     const { source, chapter } = await this.chapter(chapterId);
-    const resume = input.resumeRevisionId === undefined ? null : await this.repository.getRevision(expected(input.resumeRevisionId)!);
-    if (input.resumeRevisionId !== undefined && (input.mode !== 'reviewed' || !resume || resume.chapterId !== chapterId
-      || resume.createdBy !== 'model' || !['extract', 'extract,scan'].includes(resume.content.analysis?.calls.map(c => c.stage).join(',') ?? ''))) {
-      throw new NovelError(400, 'NOVEL_RESUME_INVALID', '只能显式继续本章的完整模型扫描检查点。');
-    }
-    if (chapter.end - chapter.start > 20_000) {
+    if (novelChapterTooLong(chapter)) {
       throw new NovelError(400, 'NOVEL_CHAPTER_TOO_LONG', '本次单章超过 20000 码点限制，请先整理章节；未调用模型。');
+    }
+    if ((await this.repository.listAttempts(chapterId)).some(attempt => attempt.status === 'submitted' || attempt.status === 'unknown')) {
+      throw new NovelError(409, 'NOVEL_ATTEMPT_PENDING', '本章已有未结束或结果未知的模型请求，请先核对，不能重复调用。');
+    }
+    const revisions = await this.repository.listRevisions(chapterId);
+    const paragraphCount = countNovelParagraphs(source, chapter);
+    const gate = novelCheckpointGate(revisions, chapter.latestRevisionId, paragraphCount);
+    const resume = input.resumeRevisionId === undefined ? null : await this.repository.getRevision(expected(input.resumeRevisionId)!);
+    if (input.resumeRevisionId !== undefined) {
+      const refusal = input.mode !== 'reviewed' || !resume || resume.chapterId !== chapterId
+        ? '只能继续本章最近的完整模型检查点，已完成阶段不会重做；未调用模型。'
+        : novelResumeRefusal(revisions, chapter.latestRevisionId, resume.id, paragraphCount);
+      if (refusal) throw new NovelError(400, 'NOVEL_RESUME_INVALID', refusal);
+    } else if (gate.resumeRevisionId && input.confirmRestart !== true) {
+      throw new NovelError(409, 'NOVEL_CHECKPOINT_RESUME_REQUIRED', '本章已有未完成的模型检查点。继续检查点不会重做已完成阶段；若要放弃检查点并重新付费提取，请明确确认。未调用模型。');
+    }
+    let resumeContext: NovelRevision[] = [];
+    if (resume?.content.analysis) {
+      resumeContext = (await Promise.all(resume.content.analysis.contextRevisionIds.map(revisionId => this.repository.getRevision(revisionId)))).filter((revision): revision is NovelRevision => revision !== null);
+      if (resumeContext.some(revision => !source.chapters.some(item => item.id === revision.chapterId && item.order < chapter.order))) {
+        throw new NovelError(400, 'NOVEL_RESUME_INVALID', '检查点上下文不属于本书前章。');
+      }
+      if (resumeContext.length !== resume.content.analysis.contextRevisionIds.length) throw new NovelError(400, 'NOVEL_RESUME_INVALID', '检查点上下文版本缺失。');
     }
     const attemptId = id('novelcall');
     await this.repository.beginAttempt({ id: attemptId, chapterId, expectedRevisionId: base,
@@ -155,13 +219,9 @@ export class NovelService {
     let saved: NovelRevision | null = null;
     try {
       let parent = base;
-      const context = resume?.content.analysis
-        ? (await Promise.all(resume.content.analysis.contextRevisionIds.map(id => this.repository.getRevision(id)))).filter((r): r is NovelRevision => r !== null)
+      const context = resume
+        ? resumeContext
         : input.mode === 'reviewed' ? await this.latestRevisions(source, chapter.order) : [];
-      if (resume && context.some(r => !source.chapters.some(c => c.id === r.chapterId && c.order < chapter.order))) {
-        throw new NovelError(400, 'NOVEL_RESUME_INVALID', '检查点上下文不属于本书前章。');
-      }
-      if (resume && context.length !== resume.content.analysis!.contextRevisionIds.length) throw new NovelError(400, 'NOVEL_RESUME_INVALID', '检查点上下文版本缺失。');
       const result = input.mode === 'reviewed'
         ? await new NovelReviewWorkflow(config, this.transport).extract(source, chapter, buildEntityRegistry(source, context), context.map(r => r.id), async content => {
           saved = await this.save(chapterId, parent, 'model', content);

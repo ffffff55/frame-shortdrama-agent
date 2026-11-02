@@ -2,13 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { BookOpen, Check, FileUp, Plus, Save, Search, Trash2 } from 'lucide-react';
 import {
   chapterTextarea, confirmationBlock, createNovelRequestGate, editNovelItem, evidenceFromRange, evidenceFromSelection,
-  filterNovelItems, isNovelItemPending, newNovelItem, novelDraftChanged, novelKindLabels, removeNovelItem, selectionAfterNovelSave, selectionForEvidence, validateNovelDraft,
-  type NovelChapter, type NovelEvidence, type NovelFilter, type NovelItem, type NovelKind, type NovelRevision, type NovelSource,
+  filterNovelItems, isNovelItemPending, newNovelItem, novelDraftChanged, novelExtractActions, novelExtractPayload, novelKindLabels, novelParagraphCount, removeNovelItem, selectionAfterNovelSave, selectionForEvidence, validateNovelDraft,
+  type NovelChapter, type NovelEvidence, type NovelExtractIntent, type NovelFilter, type NovelItem, type NovelKind, type NovelRevision, type NovelSource,
 } from './novel-editor';
 import './novel.css';
 import NovelAssetPanel from './NovelAssetPanel';
 import { assetBindingSummary, type AssetBindingInput } from './asset-library';
-import type { EntityRegistryEntry } from '@lyra/shared';
+import { novelChapterTooLong, novelCheckpointGate } from '../../shared/src/novel-checkpoint.ts';
+import type { EntityRegistryEntry, NovelAdaptationPreview, NovelAdaptationResult } from '@lyra/shared';
+import { screenplayProductionHash } from './navigation';
 import { useDesktopAssetTasks } from './DesktopAssetGeneration';
 import { desktopCompletionNeedsRefresh, desktopReloadAllowed, desktopTaskActive, desktopTaskLabels } from './desktop-asset-generation';
 
@@ -57,6 +59,8 @@ export default function NovelBreakdown({ onUnsavedChange, initialNovelId, import
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [assetDraftDirty, setAssetDraftDirty] = useState(false);
+  const [adaptAll, setAdaptAll] = useState(false);
+  const [preview, setPreview] = useState<NovelAdaptationPreview | null>(null);
   const busyRef = useRef(false);
   const gate = useRef(createNovelRequestGate());
   const sourceArea = useRef<HTMLTextAreaElement>(null);
@@ -68,11 +72,20 @@ export default function NovelBreakdown({ onUnsavedChange, initialNovelId, import
   const importDirty = Boolean(title || rawText || sourceUrl);
   const anyDirty = importDirty || assetDraftDirty || Object.values(draftBook).some(session => novelDraftChanged(session.base, session.items));
   const editable = Boolean(chapter && revision && chapter.latestRevisionId === revision.id);
+  const scope = adaptAll ? source?.chapters ?? [] : chapter ? [chapter] : [];
+  const currentPreview = preview && source?.id === preview.source.documentId && editable
+    && scope.length === preview.source.chapters.length && scope.every((item, index) =>
+      item.id === preview.source.chapters[index]?.chapterId && item.latestRevisionId === preview.source.chapters[index]?.revisionId) ? preview : null;
   const visible = filterNovelItems(items, filter, pendingOnly);
   const selectedItem = visible.find(item => item.id === selectedItemId) ?? visible[0] ?? null;
   const errors = source && chapter && dirty ? validateNovelDraft(source, chapter, items) : [];
   const pendingCount = items.filter(isNovelItemPending).length;
   const modelReady = Boolean(catalog?.configured);
+  const chapterTooLong = Boolean(chapter && novelChapterTooLong(chapter));
+  const checkpointId = source && chapter
+    ? novelCheckpointGate(revisions, chapter.latestRevisionId, novelParagraphCount(source, chapter)).resumeRevisionId
+    : null;
+  const paidActions = novelExtractActions({ tooLong: chapterTooLong, mode: extractionMode, checkpointId, hasRevision: Boolean(chapter?.latestRevisionId) });
   const assetCounts = revision ? assetBindingSummary(revision.content) : null;
   const desktop = useDesktopAssetTasks(chapterId);
   const desktopRefreshed = useRef(new Set<string>());
@@ -232,24 +245,48 @@ export default function NovelBreakdown({ onUnsavedChange, initialNovelId, import
       setMessage('本章校对已保存为新版本。原文与历史版本未改动；其他章节不受影响。');
     });
   }
-  function generate(mode: 'seed' | 'extract') {
-    if (!chapter || dirty || assetDraftDirty || (mode === 'extract' && !allowPaid)) return;
-    if (mode === 'extract' && chapter.latestRevisionId && !window.confirm(`重新提取将保存新的模型版本，已有校对保留在历史中。${extractionMode === 'reviewed' ? '本次最多调用五次模型，包含查漏、复核及一次局部修复。' : '本次调用一次模型。'}确定继续？`)) return;
+  function generate(mode: 'seed' | 'extract', intent: NovelExtractIntent = 'fresh') {
+    if (!chapter || dirty || assetDraftDirty || (mode === 'extract' && (!allowPaid || chapterTooLong || paidActions.blocked))) return;
+    if (mode === 'extract' && intent === 'resume' && !window.confirm('从最近的检查点继续，只提交尚未完成的阶段，不重做已完成的提取或查漏。确定继续？')) return;
+    if (mode === 'extract' && intent !== 'resume' && chapter.latestRevisionId && !window.confirm(intent === 'restart'
+      ? '放弃检查点并重新提取会再次为已完成阶段付费。已有校对保留在历史中。确定继续？'
+      : `重新提取将保存新的模型版本，已有校对保留在历史中。${extractionMode === 'reviewed' ? '本次最多调用五次模型，包含查漏、复核及一次局部修复。' : '本次调用一次模型。'}确定继续？`)) return;
     const currentChapter = chapter;
+    const payload = mode === 'extract' ? {
+      ...novelExtractPayload({ expectedRevisionId: currentChapter.latestRevisionId, mode: extractionMode, checkpointId, intent }),
+      expectedModelConnectionRevision: catalog?.connectionRevision,
+    } : { expectedRevisionId: currentChapter.latestRevisionId };
     setAllowPaid(false);
-    void action(mode === 'seed' ? '建立引号待核对初稿' : '模型正在拆解与检查本章，请勿重复提交', async isCurrent => {
-      const saved = await api<NovelRevision>(`/api/novel-chapters/${encodeURIComponent(currentChapter.id)}/${mode}`, {
-        expectedRevisionId: currentChapter.latestRevisionId, ...(mode === 'extract' ? { allowPaid: true, mode: extractionMode,
-          expectedModelConnectionRevision: catalog?.connectionRevision } : {}),
-      });
+    void action(mode === 'seed' ? '建立引号待核对初稿' : intent === 'resume' ? '从检查点继续，请勿重复提交' : '模型正在拆解与检查本章，请勿重复提交', async isCurrent => {
+      const saved = await api<NovelRevision>(`/api/novel-chapters/${encodeURIComponent(currentChapter.id)}/${mode}`, payload);
       if (!isCurrent()) return;
       acceptRevision(saved);
-      setMessage(mode === 'seed' ? '已建立免费引号初稿，仅标出待核对引文；人物、场景和道具需人工添加或运行模型提取。' : '本章模型结果已保存。引用匹配不等于理解正确，请逐项核对人物归属、遗漏和待确认项。');
+      setMessage(mode === 'seed' ? '已建立免费引号初稿，仅标出待核对引文；人物、场景和道具需人工添加或运行模型提取。' : intent === 'resume'
+        ? '已从检查点继续。已完成阶段没有重做；请核对新阶段的人物归属、遗漏和待确认项。'
+        : '本章模型结果已保存。引用匹配不等于理解正确，请逐项核对人物归属、遗漏和待确认项。');
+    });
+  }
+
+  function prepareScript() {
+    if (!source || !editable || anyDirty) return;
+    const chapters = scope.map(item => ({ chapterId: item.id, revisionId: item.latestRevisionId }));
+    void action('整理章节剧本', async isCurrent => {
+      const result = await api<NovelAdaptationPreview>(`/api/novels/${source.id}/screenplay/preview`, { chapters });
+      if (isCurrent()) setPreview(result);
+    });
+  }
+  function adoptScript() {
+    if (!currentPreview || !source || anyDirty) return;
+    void action('采用剧本版本', async isCurrent => {
+      const adopted = await api<NovelAdaptationResult>(`/api/novels/${source.id}/screenplay/adopt`, {
+        chapters: currentPreview.source.chapters, digest: currentPreview.digest,
+      });
+      if (isCurrent()) { onUnsavedChange?.(false); location.hash = screenplayProductionHash(adopted); }
     });
   }
 
   return <div className="novel-page">
-    <header className="novel-hero"><div><span>NOVEL · SOURCE FIRST</span><h1>小说逐章拆解</h1><p>先读清原文，再确认事实。人物、场景、道具和对白逐章保存，所有依据可回到原文核对。</p></div><BookOpen size={46} strokeWidth={1} /><p className="novel-boundary">校对确认并保存后，可关联已有素材；缺少时可授权调用设置中选定的生图 API，逐张生成候选并导入资产库，只有人工确认后才正式关联。外观补充属于设计，不改写小说事实。不改编剧本，不生成分镜，不进入 3D 导演台。</p></header>
+    <header className="novel-hero"><div><span>NOVEL · SOURCE FIRST</span><h1>小说逐章拆解</h1><p>人物、场景、道具和对白逐章保存。选用已拆解的章节，整理成剧本后即可进入自动制片。</p></div><BookOpen size={46} strokeWidth={1} /><p className="novel-boundary">已校对的事实可以关联素材。转为剧本时保留原文章节顺序和对白，生成独立剧本项目。</p></header>
 
     <section className="novel-card novel-library"><div className="novel-row"><label htmlFor="novel-library">已保存的小说</label><select id="novel-library" value={source?.id ?? ''} disabled={Boolean(busy) || !library.length} onChange={event => { if (confirmSwitch()) void action('读取小说', isCurrent => loadNovel(event.target.value, null, isCurrent)); }}><option value="" disabled>选择小说</option>{library.map(item => <option key={item.id} value={item.id}>{item.title} · {item.chapterCount} 章</option>)}</select><button disabled={Boolean(busy)} onClick={() => setImportOpen(value => !value)}><Plus size={14} />导入小说</button><button disabled={Boolean(busy)} onClick={() => { if (!confirmSwitch()) return; void action('刷新小说与版本', async isCurrent => { const result = await api<{ novels: LibraryItem[] }>('/api/novels'); if (!isCurrent()) return; setLibrary(result.novels); if (source) await loadNovel(source.id, chapterId, isCurrent); }); }}>刷新</button></div>
       {importOpen && <form className="novel-import" onSubmit={event => { event.preventDefault(); if (busyRef.current || !title.trim() || !rawText.trim() || !confirmSwitch()) return; void action('保存小说与章节', async isCurrent => {
@@ -272,18 +309,32 @@ export default function NovelBreakdown({ onUnsavedChange, initialNovelId, import
     {!source && !busy && <section className="novel-empty"><BookOpen size={28} /><h2>从原文章节开始</h2><p>导入 TXT 或粘贴原文后，会显示每章的独立校对与版本历史。这里没有预置或凭空补写的小说正文。</p></section>}
 
     {source && chapter && <div className="novel-workspace"><aside className="novel-chapters novel-card"><h2>{source.title}</h2><p>{source.chapters.length} 个章节 · 原文只读</p>{source.sourceUrl && <a href={source.sourceUrl} target="_blank" rel="noreferrer">查看记录的出处 ↗</a>}<nav aria-label="小说章节">{source.chapters.map(item => <button key={item.id} className={item.id === chapter.id ? 'active' : ''} disabled={Boolean(busy)} aria-current={item.id === chapter.id ? 'page' : undefined} onClick={() => { if (item.id !== chapter.id && confirmSwitch()) void action('读取章节', isCurrent => loadChapter(source, item.id, isCurrent)); }}><span>{String(item.order).padStart(2, '0')}</span><strong>{item.title}</strong><small>{item.latestRevisionId ? '有保存版本' : '尚未拆解'}</small></button>)}</nav></aside>
-      <div className="novel-main"><section className="novel-card novel-chapter-head"><div><span>当前章节</span><h2>{chapter.title}</h2><p>全文码点 {chapter.start}–{chapter.end} · {chapter.end - chapter.start} 字符。引用使用零基、左闭右开范围，包含换行。</p></div>
+      <div className="novel-main"><section className="novel-card novel-chapter-head"><div><span>当前章节</span><h2>{chapter.title}</h2><p>全文码点 {chapter.start}–{chapter.end} · {chapter.end - chapter.start} 码点。引用使用零基、左闭右开范围，包含换行。</p></div>
         <div className="novel-extract-actions"><button disabled={Boolean(busy) || Boolean(chapter.latestRevisionId)} onClick={() => generate('seed')}>免费建立引号待核对初稿</button><small>只标记引号，不猜人物，不是 AI 拆解。</small>
           <small>{modelReady ? `当前拆解模型：${catalog!.defaultModel}` : '拆解模型未配置或状态不可用'} · <a href="#/settings/models">管理模型连接</a></small>
           <label>拆解方式<select aria-label="拆解方式" value={extractionMode} disabled={Boolean(busy)} onChange={event => { setExtractionMode(event.target.value as 'single' | 'reviewed'); setAllowPaid(false); }}><option value="reviewed">拆解＋逐段查漏＋证据复核（最多五次调用）</option><option value="single">单次初稿（一次调用）</option></select></label>
-          <label className="novel-consent"><input type="checkbox" checked={allowPaid} disabled={Boolean(busy) || !modelReady || dirty || assetDraftDirty} onChange={event => setAllowPaid(event.target.checked)} /><span>允许向已配置模型发送本章原文{extractionMode === 'reviewed' ? '及前章实体依据，完成三阶段检查；有问题再局部修复与复核一次，最多五次调用' : '，调用一次'}，可能计费；请求失败不自动重试。</span></label>
-          <button className="novel-primary" disabled={Boolean(busy) || !modelReady || !allowPaid || dirty || assetDraftDirty} onClick={() => generate('extract')}>{chapter.latestRevisionId ? '重新提取本章（新版本）' : '提取本章人物、场景、道具与对白'}</button>{!modelReady && <small>模型未配置或服务未连接；仍可使用免费初稿和人工校对。</small>}{(dirty || assetDraftDirty) && <small>先保存或放弃本章校对与引用草稿，再运行模型。</small>}</div></section>
+          {chapterTooLong && <small role="status">本章 {chapter.end - chapter.start} 码点，超过 20000 码点上限。请先拆成更短的章节；不会调用模型。</small>}
+          {checkpointId && !chapterTooLong && <small>已有可继续的模型检查点。多阶段继续不会重做已完成阶段。结果未知的调用仍不能自动重试。</small>}
+          <label className="novel-consent"><input type="checkbox" checked={allowPaid} disabled={Boolean(busy) || !modelReady || dirty || assetDraftDirty || chapterTooLong} onChange={event => setAllowPaid(event.target.checked)} /><span>{paidActions.primaryIntent === 'resume' ? '允许从检查点继续未完成阶段，不重做已完成的提取或查漏，可能计费；请求失败不自动重试。' : `允许向已配置模型发送本章原文${extractionMode === 'reviewed' ? '及前章实体依据，完成三阶段检查；有问题再局部修复与复核一次，最多五次调用' : '，调用一次'}，可能计费；请求失败不自动重试。`}</span></label>
+          <button className="novel-primary" disabled={Boolean(busy) || !modelReady || !allowPaid || dirty || assetDraftDirty || paidActions.blocked} onClick={() => generate('extract', paidActions.primaryIntent)}>{paidActions.primaryLabel}</button>
+          {paidActions.restartLabel && <button disabled={Boolean(busy) || !modelReady || !allowPaid || dirty || assetDraftDirty || paidActions.blocked} onClick={() => generate('extract', 'restart')}>{paidActions.restartLabel}</button>}
+          {!modelReady && <small>模型未配置或服务未连接；仍可使用免费初稿和人工校对。</small>}{(dirty || assetDraftDirty) && <small>先保存或放弃本章校对与引用草稿，再运行模型。</small>}</div></section>
         {registry.length > 0 && <details className="novel-card"><summary>跨章实体表 · {registry.length} 项</summary><p>根据各章最新保存版本汇总；模型身份仍需核对。名称相似不自动合并。</p><table><thead><tr><th>名称 / 别名</th><th>分类</th><th>章节 / 确认</th></tr></thead><tbody>{registry.map(entry => <tr key={entry.id}><td>{entry.name}<small> · {entry.aliases.filter(a => a !== entry.name).join('、')}</small></td><td>{entry.entityType ? entityTypeLabels[entry.entityType] : '旧记录未分类'}</td><td>{new Set(entry.occurrences.map(o => o.chapterId)).size} 章 · {entry.occurrences.filter(o => o.confirmed).length} 项已确认</td></tr>)}</tbody></table></details>}
         {revision?.content.analysis && <details className="novel-card" open><summary>模型检查记录 · {revision.content.analysis.calls.length} 次调用 · {{ partial: '未完成，成果已保留', needsReview: '有问题待确认', reviewed: '模型复核完成，待人工确认', humanEdited: '已有人工修改，检查记录仅供追溯' }[revision.content.analysis.status]}</summary><p>逐段扫描 {revision.content.analysis.paragraphCoverage.length} 段 · 前章上下文 {revision.content.analysis.contextRevisionIds.length} 个版本。扫描覆盖不等于语义完整。</p><ol>{revision.content.analysis.issues.map((issue, index) => <li key={index}>{issue.reason}（{issue.paragraphIds.join('、')}）</li>)}</ol></details>}
 
         {revision && <section className="novel-card novel-revision-bar"><div className="novel-row"><label htmlFor="novel-revision">版本历史</label><select id="novel-revision" value={revision.id} disabled={Boolean(busy)} onChange={event => { if (confirmSwitch()) { setRevisionId(event.target.value); setSelectedItemId(''); setSelection(null); } }}>{revisions.map((item, index) => <option key={item.id} value={item.id}>V{index + 1} · {revisionLabels[item.createdBy]} · {new Date(item.createdAt).toLocaleString()}{item.id === chapter.latestRevisionId ? ' · 最新' : ''}</option>)}</select></div><p>{editable ? '只编辑当前章的最新版本。保存会追加新版本，不覆盖原文或历史。' : dirty ? '此基准已不是最新版本。当前显示保留的未保存草稿，不是服务器历史原版；可先导出留存，再放弃草稿查看原版。不能覆盖最新保存结果。' : '这是历史版本，只读。切回最新版本后可继续校对。'} · 当前 {items.length} 项，{pendingCount} 项待确认 / 未校对。</p>{revision.content.warnings.length > 0 && <details className="novel-warnings" open><summary>本版本检查提示 · 不等于语义验收通过</summary><ul>{revision.content.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></details>}
           {dirty && <div className="novel-save-bar"><div><strong>有未保存的本章校对</strong><small>可以保留待确认项再保存；保存本身不调用模型。</small></div><div className="novel-row"><button disabled={Boolean(busy)} onClick={exportUnsavedDraft}>导出草稿</button><button disabled={Boolean(busy)} onClick={() => { if (window.confirm('放弃该版本尚未保存的校对？已保存的历史不会改动。')) setDraftBook(previous => { const next = { ...previous }; delete next[revision.id]; return next; }); }}>放弃草稿</button><button className="novel-primary" disabled={Boolean(busy) || !editable || errors.length > 0} onClick={saveCorrections}><Save size={14} />保存为新版本</button></div></div>}{errors.length > 0 && <ul className="novel-errors" role="alert">{errors.slice(0, 8).map(error => <li key={error}>{error}</li>)}{errors.length > 8 && <li>另有 {errors.length - 8} 个待修正问题。</li>}</ul>}</section>}
 
+        {revision && <section className="novel-card" aria-label="小说转剧本"><h3>小说转剧本</h3>
+          <p>按原文顺序整理动作、人物与对白。预览与采用免费，进入自动制片后再设置预算。</p>
+          <div className="novel-row"><select aria-label="剧本章节范围" value={adaptAll ? 'all' : 'chapter'} disabled={Boolean(busy)} onChange={event => { setAdaptAll(event.target.value === 'all'); setPreview(null); }}>
+            <option value="chapter">当前章节</option><option value="all">全书合为一集</option></select>
+            <button disabled={Boolean(busy) || anyDirty || !editable || scope.some(item => !item.latestRevisionId)} onClick={prepareScript}>预览剧本</button></div>
+          {scope.some(item => !item.latestRevisionId) && <small>所选范围中仍有章节尚未拆解。</small>}
+          {anyDirty && <small>请先保存或放弃当前页面的草稿。</small>}
+          {currentPreview && <><textarea readOnly rows={10} aria-label="转换后的剧本草稿" value={currentPreview.rawText} />
+            <button className="novel-primary" disabled={Boolean(busy) || anyDirty} onClick={adoptScript}>采用剧本并进入自动制片</button></>}
+        </section>}
         {assetCounts && <div className="novel-asset-summary" aria-label="本章已保存资产状态"><strong>本章资产引用 · 已保存版本</strong><span>已关联 {assetCounts.linked}</span><span>待补 {assetCounts.missing}</span><span>引用待重核 {assetCounts.needsReview}</span><span>待校对 {assetCounts.unconfirmed}</span><a href="#/assets">查看资产目录 ↗</a></div>}
         {activeDesktopTasks.length > 0 && <p className="novel-message novel-desktop-notice" role="status">生图任务：{activeDesktopTasks.map(task => `${task.label} · ${desktopTaskLabels[task.status]}`).join('；')}。任务已保存，刷新页面可继续查看进度；不会因刷新重复提交。</p>}
         {completedDesktopTask && (anyDirty || !editable) && <p className="novel-message novel-desktop-notice" role="status">「{completedDesktopTask.label}」图片已导回并关联到服务器新版本。{anyDirty ? '本页有未保存草稿，已保留，没有自动覆盖。请先导出或处理草稿，再刷新查看。' : '当前正在查看历史版本，已保持原视图。刷新可查看新关联。'}</p>}
